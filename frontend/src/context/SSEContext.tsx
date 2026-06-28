@@ -40,6 +40,8 @@ export function SSEProvider({ children }: { children: React.ReactNode }) {
   const esRef = useRef<EventSource | null>(null)
 
   useEffect(() => {
+    let timerId: ReturnType<typeof setTimeout> | undefined
+
     function connect() {
       const es = new EventSource('/events')
       esRef.current = es
@@ -59,12 +61,16 @@ export function SSEProvider({ children }: { children: React.ReactNode }) {
 
       es.onerror = () => {
         es.close()
-        setTimeout(connect, 2000)
+        esRef.current = null
+        timerId = setTimeout(connect, 2000)
       }
     }
 
     connect()
-    return () => esRef.current?.close()
+    return () => {
+      clearTimeout(timerId)
+      esRef.current?.close()
+    }
   }, [])
 
   return (

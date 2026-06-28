@@ -33,14 +33,18 @@ type Handler struct {
 	mu      sync.Mutex
 	cfg     config
 	sfGroup singleflight.Group
+
+	watcherMu sync.Mutex
+	watchers  map[string]context.CancelFunc
 }
 
 // New returns a Handler with sensible defaults.
 func New(c cache.Cache, d *db.DB, b *sse.Broker) *Handler {
 	return &Handler{
-		cache:  c,
-		db:     d,
-		broker: b,
+		cache:    c,
+		db:       d,
+		broker:   b,
+		watchers: make(map[string]context.CancelFunc),
 		cfg: config{
 			LatencyMs:           300,
 			TtlMs:               30000,
@@ -53,21 +57,17 @@ func New(c cache.Cache, d *db.DB, b *sse.Broker) *Handler {
 
 // ---------- helpers ----------
 
-func (h *Handler) actualTTL() time.Duration {
+// ttlPair returns the effective TTL duration and its millisecond value under a single lock,
+// preventing a race where the two values diverge if config changes between reads.
+func (h *Handler) ttlPair() (time.Duration, int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	ms := h.cfg.TtlMs / h.cfg.SpeedMultiplier
-	return time.Duration(ms) * time.Millisecond
-}
-
-func (h *Handler) actualTTLMs() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.cfg.TtlMs / h.cfg.SpeedMultiplier
+	return time.Duration(ms) * time.Millisecond, ms
 }
 
 // cacheStateEvent builds a cache_state event by iterating all known keys.
-func (h *Handler) cacheStateEvent(ctx context.Context) map[string]any {
+func (h *Handler) cacheStateEvent(_ context.Context) map[string]any {
 	mc, ok := h.cache.(*cache.MemoryCache)
 	if !ok {
 		return map[string]any{"type": "cache_state", "entries": []any{}}
@@ -86,19 +86,56 @@ func (h *Handler) cacheStateEvent(ctx context.Context) map[string]any {
 }
 
 // watchExpiry starts a goroutine that fires a cache_expire event when key expires.
-func (h *Handler) watchExpiry(ctx context.Context, key string, ttl time.Duration) {
+// It cancels any existing watcher for the same key before starting a new one, ensuring
+// at most one goroutine per key and preventing spurious events after explicit deletes.
+func (h *Handler) watchExpiry(key string, ttl time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	h.watcherMu.Lock()
+	if old, ok := h.watchers[key]; ok {
+		old()
+	}
+	h.watchers[key] = cancel
+	h.watcherMu.Unlock()
+
 	go func() {
 		select {
 		case <-time.After(ttl):
 		case <-ctx.Done():
 			return
 		}
-		_, hit, err := h.cache.Get(ctx, key)
+
+		h.watcherMu.Lock()
+		delete(h.watchers, key)
+		h.watcherMu.Unlock()
+
+		_, hit, err := h.cache.Get(context.Background(), key)
 		if err != nil || hit {
 			return
 		}
 		h.broker.Publish(map[string]any{"type": "cache_expire", "key": key})
 	}()
+}
+
+// cancelWatcher cancels and removes the expiry watcher for key, if one exists.
+// Call this before explicitly deleting a key to prevent a spurious cache_expire event.
+func (h *Handler) cancelWatcher(key string) {
+	h.watcherMu.Lock()
+	if cancel, ok := h.watchers[key]; ok {
+		cancel()
+		delete(h.watchers, key)
+	}
+	h.watcherMu.Unlock()
+}
+
+// cancelAllWatchers cancels every active expiry watcher. Call before Flush.
+func (h *Handler) cancelAllWatchers() {
+	h.watcherMu.Lock()
+	for key, cancel := range h.watchers {
+		cancel()
+		delete(h.watchers, key)
+	}
+	h.watcherMu.Unlock()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -180,7 +217,7 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 			value     string
 			latencyMs int64
 		}
-		v, err2, _ := h.sfGroup.Do(key, func() (any, error) {
+		v, err2, shared := h.sfGroup.Do(key, func() (any, error) {
 			start := time.Now()
 			val, e := h.db.Get(ctx, key)
 			return fetchResult{value: val, latencyMs: time.Since(start).Milliseconds()}, e
@@ -192,6 +229,13 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 		res := v.(fetchResult)
 		fetchValue = res.value
 		latencyMs = res.latencyMs
+
+		if shared {
+			// Another goroutine already published events, set the cache, and started
+			// the expiry watcher. Just return the value.
+			writeJSON(w, http.StatusOK, json.RawMessage(fetchValue))
+			return
+		}
 	} else {
 		start := time.Now()
 		fetchValue, err = h.db.Get(ctx, key)
@@ -202,10 +246,10 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 		latencyMs = time.Since(start).Milliseconds()
 	}
 
+	// Only the goroutine that actually performed the DB fetch reaches here.
 	h.broker.Publish(map[string]any{"type": "db_fetch", "key": key, "latencyMs": latencyMs})
 
-	ttl := h.actualTTL()
-	ttlMs := h.actualTTLMs()
+	ttl, ttlMs := h.ttlPair()
 	if err := h.cache.Set(ctx, key, fetchValue, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -213,7 +257,7 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 	h.broker.Publish(map[string]any{"type": "cache_set", "key": key, "value": fetchValue, "ttlMs": ttlMs})
 	h.broker.Publish(h.cacheStateEvent(ctx))
 
-	h.watchExpiry(context.Background(), key, ttl)
+	h.watchExpiry(key, ttl)
 
 	writeJSON(w, http.StatusOK, json.RawMessage(fetchValue))
 }
@@ -245,16 +289,16 @@ func (h *Handler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 
 	if strategy == "write-through" {
-		ttl := h.actualTTL()
-		ttlMs := h.actualTTLMs()
+		ttl, ttlMs := h.ttlPair()
 		if err := h.cache.Set(ctx, key, body.Value, ttl); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		h.broker.Publish(map[string]any{"type": "cache_set", "key": key, "value": body.Value, "ttlMs": ttlMs})
 		h.broker.Publish(h.cacheStateEvent(ctx))
-		h.watchExpiry(context.Background(), key, ttl)
+		h.watchExpiry(key, ttl) // cancels any prior watcher and starts a fresh one
 	} else if body.Invalidate {
+		h.cancelWatcher(key) // prevent a pending watcher from firing a spurious cache_expire
 		if err := h.cache.Delete(ctx, key); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -271,6 +315,7 @@ func (h *Handler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 // ResetCache flushes all cache entries and emits a cache_state event.
 func (h *Handler) ResetCache(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	h.cancelAllWatchers() // prevent stale watchers from firing after the flush
 	if err := h.cache.Flush(ctx); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

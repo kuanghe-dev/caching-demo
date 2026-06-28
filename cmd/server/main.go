@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net/http"
 
 	cachingdemo "github.com/kuanghe-dev/caching-demo"
@@ -32,5 +33,5 @@ func main() {
 	// Serve embedded frontend static files at "/".
 	r.Handle("/*", cachingdemo.StaticHandler())
 
-	http.ListenAndServe(":8080", r)
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
