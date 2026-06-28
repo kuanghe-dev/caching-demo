@@ -61,3 +61,30 @@ func (c *MemoryCache) Delete(_ context.Context, key string) error {
 	c.mu.Unlock()
 	return nil
 }
+
+// SnapshotEntry is a single cache entry returned by Snapshot.
+type SnapshotEntry struct {
+	Key       string
+	Value     string
+	ExpiresAt time.Time
+}
+
+// Snapshot returns all non-expired entries in the cache.
+func (c *MemoryCache) Snapshot() []SnapshotEntry {
+	now := time.Now()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entries := make([]SnapshotEntry, 0, len(c.items))
+	for k, e := range c.items {
+		if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+			continue // lazily skip expired entries
+		}
+		entries = append(entries, SnapshotEntry{
+			Key:       k,
+			Value:     e.value,
+			ExpiresAt: e.expiresAt,
+		})
+	}
+	return entries
+}
