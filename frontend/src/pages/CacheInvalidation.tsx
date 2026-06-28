@@ -27,45 +27,66 @@ export function CacheInvalidation() {
     }
   }, [location.pathname, clearEvents])
 
-  const lastEvent = events[events.length - 1]
-  const lastEventRef = useRef<typeof lastEvent>(undefined)
+  const processedCount = useRef(0)
 
   useEffect(() => {
-    if (!lastEvent || lastEvent === lastEventRef.current) return
-    lastEventRef.current = lastEvent
+    const newEvents = events.slice(processedCount.current)
+    processedCount.current = events.length
+    if (newEvents.length === 0) return
 
-    if (lastEvent.type === 'cache_hit') {
-      setActiveEdges(['client-cache', 'cache-client'])
-      setFlash({ nodeId: 'cache', color: 'green' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
-    } else if (lastEvent.type === 'cache_miss') {
-      setFlash({ nodeId: 'cache', color: 'red' })
-      setTimeout(() => setFlash(null), 600)
-    } else if (lastEvent.type === 'db_fetch') {
-      setActiveEdges(['cache-db', 'db-cache'])
-      setFlash({ nodeId: 'db', color: 'yellow' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
-    } else if (lastEvent.type === 'cache_set') {
-      setActiveEdges(['cache-client'])
-      setFlash({ nodeId: 'cache', color: 'blue' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000)
-      // Once cache_set fires after a stale write, the key is fresh again
-      setStaleKeys((prev) => {
-        const next = new Set(prev)
-        next.delete(lastEvent.key)
-        return next
-      })
-    } else if (lastEvent.type === 'cache_delete') {
-      setActiveEdges(['client-cache'])
-      setFlash({ nodeId: 'cache', color: 'red' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 800)
-      setStaleKeys((prev) => {
-        const next = new Set(prev)
-        next.delete(lastEvent.key)
-        return next
-      })
+    let delay = 0
+    const timers: ReturnType<typeof setTimeout>[] = []
+
+    for (const event of newEvents) {
+      if (event.type === 'cache_hit') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['client-cache', 'cache-client'])
+          setFlash({ nodeId: 'cache', color: 'green' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
+        }, d))
+        delay += 1200
+      } else if (event.type === 'cache_miss') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setFlash({ nodeId: 'cache', color: 'red' })
+          setTimeout(() => setFlash(null), 600)
+        }, d))
+        delay += 600
+      } else if (event.type === 'db_fetch') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['cache-db', 'db-cache'])
+          setFlash({ nodeId: 'db', color: 'yellow' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
+        }, d))
+        delay += 1200
+      } else if (event.type === 'cache_set') {
+        // Stale key removal is data state — update immediately, not in the animation queue
+        const key = event.key
+        setStaleKeys((prev) => { const next = new Set(prev); next.delete(key); return next })
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['cache-client'])
+          setFlash({ nodeId: 'cache', color: 'blue' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000)
+        }, d))
+        delay += 1000
+      } else if (event.type === 'cache_delete') {
+        const key = event.key
+        setStaleKeys((prev) => { const next = new Set(prev); next.delete(key); return next })
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['client-cache'])
+          setFlash({ nodeId: 'cache', color: 'red' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 800)
+        }, d))
+        delay += 800
+      }
     }
-  }, [lastEvent])
+
+    return () => timers.forEach(clearTimeout)
+  }, [events])
 
   async function fetchProduct() {
     setLoading(true)

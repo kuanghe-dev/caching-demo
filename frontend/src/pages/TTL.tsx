@@ -31,33 +31,60 @@ export function TTL() {
     return () => clearInterval(id)
   }, [])
 
-  const lastEvent = events[events.length - 1]
-  const lastEventRef = useRef<typeof lastEvent>(undefined)
+  const processedCount = useRef(0)
 
   useEffect(() => {
-    if (!lastEvent || lastEvent === lastEventRef.current) return
-    lastEventRef.current = lastEvent
+    const newEvents = events.slice(processedCount.current)
+    processedCount.current = events.length
+    if (newEvents.length === 0) return
 
-    if (lastEvent.type === 'cache_hit') {
-      setActiveEdges(['client-cache', 'cache-client'])
-      setFlash({ nodeId: 'cache', color: 'green' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
-    } else if (lastEvent.type === 'cache_miss') {
-      setFlash({ nodeId: 'cache', color: 'red' })
-      setTimeout(() => setFlash(null), 600)
-    } else if (lastEvent.type === 'db_fetch') {
-      setActiveEdges(['cache-db', 'db-cache'])
-      setFlash({ nodeId: 'db', color: 'yellow' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
-    } else if (lastEvent.type === 'cache_set') {
-      setActiveEdges(['cache-client'])
-      setFlash({ nodeId: 'cache', color: 'blue' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000)
-    } else if (lastEvent.type === 'cache_expire') {
-      setFlash({ nodeId: 'cache', color: 'red' })
-      setTimeout(() => setFlash(null), 800)
+    let delay = 0
+    const timers: ReturnType<typeof setTimeout>[] = []
+
+    for (const event of newEvents) {
+      if (event.type === 'cache_hit') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['client-cache', 'cache-client'])
+          setFlash({ nodeId: 'cache', color: 'green' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
+        }, d))
+        delay += 1200
+      } else if (event.type === 'cache_miss') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setFlash({ nodeId: 'cache', color: 'red' })
+          setTimeout(() => setFlash(null), 600)
+        }, d))
+        delay += 600
+      } else if (event.type === 'db_fetch') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['cache-db', 'db-cache'])
+          setFlash({ nodeId: 'db', color: 'yellow' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
+        }, d))
+        delay += 1200
+      } else if (event.type === 'cache_set') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setActiveEdges(['cache-client'])
+          setFlash({ nodeId: 'cache', color: 'blue' })
+          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000)
+        }, d))
+        delay += 1000
+      } else if (event.type === 'cache_expire') {
+        const d = delay
+        timers.push(setTimeout(() => {
+          setFlash({ nodeId: 'cache', color: 'red' })
+          setTimeout(() => setFlash(null), 800)
+        }, d))
+        delay += 800
+      }
     }
-  }, [lastEvent])
+
+    return () => timers.forEach(clearTimeout)
+  }, [events])
 
   async function postConfig(patch: Record<string, unknown>) {
     await fetch('/api/config', {

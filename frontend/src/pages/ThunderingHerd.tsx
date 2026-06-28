@@ -24,29 +24,37 @@ export function ThunderingHerd() {
     }
   }, [location.pathname, clearEvents])
 
-  const lastEvent = events[events.length - 1]
-  const lastEventRef = useRef<typeof lastEvent>(undefined)
+  // Process all new events without delay — ThunderingHerd visualizes parallel bursts,
+  // not sequential steps, so all events in a batch fire simultaneously.
+  const processedCount = useRef(0)
 
   useEffect(() => {
-    if (!lastEvent || lastEvent === lastEventRef.current) return
-    lastEventRef.current = lastEvent
+    const newEvents = events.slice(processedCount.current)
+    processedCount.current = events.length
+    if (newEvents.length === 0) return
 
-    if (lastEvent.type === 'cache_hit') {
-      setActiveEdges(['client-cache', 'cache-client'])
-      setFlash({ nodeId: 'cache', color: 'green' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 800)
-    } else if (lastEvent.type === 'cache_miss') {
-      setFlash({ nodeId: 'cache', color: 'red' })
-      setTimeout(() => setFlash(null), 400)
-    } else if (lastEvent.type === 'db_fetch') {
-      setActiveEdges(['cache-db'])
-      setFlash({ nodeId: 'db', color: 'yellow' })
-      setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
-    } else if (lastEvent.type === 'cache_set') {
-      setFlash({ nodeId: 'cache', color: 'blue' })
-      setTimeout(() => setFlash(null), 600)
+    const timers: ReturnType<typeof setTimeout>[] = []
+
+    for (const event of newEvents) {
+      if (event.type === 'cache_hit') {
+        setActiveEdges(['client-cache', 'cache-client'])
+        setFlash({ nodeId: 'cache', color: 'green' })
+        timers.push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 800))
+      } else if (event.type === 'cache_miss') {
+        setFlash({ nodeId: 'cache', color: 'red' })
+        timers.push(setTimeout(() => setFlash(null), 400))
+      } else if (event.type === 'db_fetch') {
+        setActiveEdges(['cache-db'])
+        setFlash({ nodeId: 'db', color: 'yellow' })
+        timers.push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200))
+      } else if (event.type === 'cache_set') {
+        setFlash({ nodeId: 'cache', color: 'blue' })
+        timers.push(setTimeout(() => setFlash(null), 600))
+      }
     }
-  }, [lastEvent])
+
+    return () => timers.forEach(clearTimeout)
+  }, [events])
 
   async function toggleSingleflight(enabled: boolean) {
     setSingleflight(enabled)
