@@ -27,51 +27,59 @@ export function CacheHitMiss() {
   // Process all new events as a sequential queue so that db_fetch and cache_set
   // arriving in the same React batch don't cause db_fetch to be silently skipped.
   const processedCount = useRef(0)
+  // Tracks ALL timers (outer scheduling + inner cleanup) so a new batch can cancel everything.
+  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([])
 
   useEffect(() => {
     const newEvents = events.slice(processedCount.current)
     processedCount.current = events.length
     if (newEvents.length === 0) return
 
+    // Cancel any in-flight timers from a previous batch, including orphaned cleanup timers
+    // that would otherwise fire and wipe out the new animation's state.
+    timersRef.current.forEach(clearTimeout)
+    timersRef.current = []
+
+    const push = (t: ReturnType<typeof setTimeout>) => { timersRef.current.push(t) }
+
     let delay = 0
-    const timers: ReturnType<typeof setTimeout>[] = []
 
     for (const event of newEvents) {
       if (event.type === 'cache_hit') {
         const d = delay
-        timers.push(setTimeout(() => {
+        push(setTimeout(() => {
           setActiveEdges(['client-cache', 'cache-client'])
           setFlash({ nodeId: 'cache', color: 'green' })
-          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
+          push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200))
         }, d))
         delay += 1200
       } else if (event.type === 'cache_miss') {
         const d = delay
-        timers.push(setTimeout(() => {
+        push(setTimeout(() => {
           setFlash({ nodeId: 'cache', color: 'red' })
-          setTimeout(() => setFlash(null), 600)
+          push(setTimeout(() => setFlash(null), 600))
         }, d))
         delay += 600
       } else if (event.type === 'db_fetch') {
         const d = delay
-        timers.push(setTimeout(() => {
+        push(setTimeout(() => {
           setActiveEdges(['cache-db', 'db-cache'])
           setFlash({ nodeId: 'db', color: 'yellow' })
-          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200)
+          push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200))
         }, d))
         delay += 1200
       } else if (event.type === 'cache_set') {
         const d = delay
-        timers.push(setTimeout(() => {
+        push(setTimeout(() => {
           setActiveEdges(['cache-client'])
           setFlash({ nodeId: 'cache', color: 'blue' })
-          setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000)
+          push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000))
         }, d))
         delay += 1000
       }
     }
 
-    return () => timers.forEach(clearTimeout)
+    return () => { timersRef.current.forEach(clearTimeout); timersRef.current = [] }
   }, [events])
 
   async function fetchProduct() {
