@@ -27,6 +27,7 @@ func main() {
 	r.Post("/api/products/{id}", h.UpdateProduct)
 	r.Get("/api/config", h.GetConfig)
 	r.Post("/api/config", h.UpdateConfig)
+	r.Post("/api/cache/reset", h.ResetCache)
 
 	// Serve embedded frontend static files at "/".
 	r.Handle("/*", cachingdemo.StaticHandler())

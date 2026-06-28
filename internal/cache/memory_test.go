@@ -131,3 +131,30 @@ func TestConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestFlush(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	c := newCache()
+
+	keys := []string{"a", "b", "c"}
+	for _, k := range keys {
+		if err := c.Set(ctx, k, "v", 0); err != nil {
+			t.Fatalf("Set %q: %v", k, err)
+		}
+	}
+
+	if err := c.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	for _, k := range keys {
+		_, ok, err := c.Get(ctx, k)
+		if err != nil {
+			t.Fatalf("Get %q after Flush: %v", k, err)
+		}
+		if ok {
+			t.Fatalf("key %q should be gone after Flush", k)
+		}
+	}
+}

@@ -62,6 +62,14 @@ func (c *MemoryCache) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+// Flush removes all entries from the cache.
+func (c *MemoryCache) Flush(_ context.Context) error {
+	c.mu.Lock()
+	c.items = make(map[string]*entry)
+	c.mu.Unlock()
+	return nil
+}
+
 // SnapshotEntry is a single cache entry returned by Snapshot.
 type SnapshotEntry struct {
 	Key       string

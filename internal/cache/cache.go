@@ -15,4 +15,7 @@ type Cache interface {
 
 	// Delete removes a key. It is a no-op if the key does not exist.
 	Delete(ctx context.Context, key string) error
+
+	// Flush removes all entries from the cache.
+	Flush(ctx context.Context) error
 }

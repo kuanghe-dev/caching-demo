@@ -12,13 +12,16 @@ import (
 	"github.com/kuanghe-dev/caching-demo/internal/cache"
 	"github.com/kuanghe-dev/caching-demo/internal/db"
 	"github.com/kuanghe-dev/caching-demo/internal/sse"
+	"golang.org/x/sync/singleflight"
 )
 
 // config holds the mutable runtime configuration.
 type config struct {
-	LatencyMs       int `json:"latencyMs"`
-	TtlMs           int `json:"ttlMs"`
-	SpeedMultiplier int `json:"speedMultiplier"`
+	LatencyMs           int    `json:"latencyMs"`
+	TtlMs               int    `json:"ttlMs"`
+	SpeedMultiplier     int    `json:"speedMultiplier"`
+	SingleflightEnabled bool   `json:"singleflightEnabled"`
+	Strategy            string `json:"strategy"` // "cache-aside" | "read-through" | "write-through"
 }
 
 // Handler holds all dependencies and serves the REST + SSE API.
@@ -27,8 +30,9 @@ type Handler struct {
 	db     *db.DB
 	broker *sse.Broker
 
-	mu  sync.Mutex
-	cfg config
+	mu      sync.Mutex
+	cfg     config
+	sfGroup singleflight.Group
 }
 
 // New returns a Handler with sensible defaults.
@@ -38,9 +42,11 @@ func New(c cache.Cache, d *db.DB, b *sse.Broker) *Handler {
 		db:     d,
 		broker: b,
 		cfg: config{
-			LatencyMs:       300,
-			TtlMs:           30000,
-			SpeedMultiplier: 1,
+			LatencyMs:           300,
+			TtlMs:               30000,
+			SpeedMultiplier:     1,
+			SingleflightEnabled: false,
+			Strategy:            "cache-aside",
 		},
 	}
 }
@@ -61,7 +67,6 @@ func (h *Handler) actualTTLMs() int {
 }
 
 // cacheStateEvent builds a cache_state event by iterating all known keys.
-// Because MemoryCache uses lazy expiry we call Get per key; expired entries come back false.
 func (h *Handler) cacheStateEvent(ctx context.Context) map[string]any {
 	mc, ok := h.cache.(*cache.MemoryCache)
 	if !ok {
@@ -88,10 +93,9 @@ func (h *Handler) watchExpiry(ctx context.Context, key string, ttl time.Duration
 		case <-ctx.Done():
 			return
 		}
-		// Lazy-expiry: if Get returns a miss, the key has expired.
 		_, hit, err := h.cache.Get(ctx, key)
 		if err != nil || hit {
-			return // still live (re-set) or context cancelled
+			return
 		}
 		h.broker.Publish(map[string]any{"type": "cache_expire", "key": key})
 	}()
@@ -143,7 +147,7 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 
 // ---------- GET /api/products/:id ----------
 
-// GetProduct implements cache-aside read.
+// GetProduct implements cache-aside (or read-through) read, with optional singleflight.
 func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	key := "product:" + id
@@ -162,36 +166,61 @@ func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cache miss — fetch from DB.
 	h.broker.Publish(map[string]any{"type": "cache_miss", "key": key})
 
-	start := time.Now()
-	value, err = h.db.Get(ctx, key)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
+	h.mu.Lock()
+	sfEnabled := h.cfg.SingleflightEnabled
+	h.mu.Unlock()
+
+	var fetchValue string
+	var latencyMs int64
+
+	if sfEnabled {
+		type fetchResult struct {
+			value     string
+			latencyMs int64
+		}
+		v, err2, _ := h.sfGroup.Do(key, func() (any, error) {
+			start := time.Now()
+			val, e := h.db.Get(ctx, key)
+			return fetchResult{value: val, latencyMs: time.Since(start).Milliseconds()}, e
+		})
+		if err2 != nil {
+			http.Error(w, err2.Error(), http.StatusNotFound)
+			return
+		}
+		res := v.(fetchResult)
+		fetchValue = res.value
+		latencyMs = res.latencyMs
+	} else {
+		start := time.Now()
+		fetchValue, err = h.db.Get(ctx, key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		latencyMs = time.Since(start).Milliseconds()
 	}
-	latencyMs := time.Since(start).Milliseconds()
+
 	h.broker.Publish(map[string]any{"type": "db_fetch", "key": key, "latencyMs": latencyMs})
 
 	ttl := h.actualTTL()
 	ttlMs := h.actualTTLMs()
-	if err := h.cache.Set(ctx, key, value, ttl); err != nil {
+	if err := h.cache.Set(ctx, key, fetchValue, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.broker.Publish(map[string]any{"type": "cache_set", "key": key, "value": value, "ttlMs": ttlMs})
+	h.broker.Publish(map[string]any{"type": "cache_set", "key": key, "value": fetchValue, "ttlMs": ttlMs})
 	h.broker.Publish(h.cacheStateEvent(ctx))
 
-	// Start expiry watcher using a background context so it outlives the request.
 	h.watchExpiry(context.Background(), key, ttl)
 
-	writeJSON(w, http.StatusOK, json.RawMessage(value))
+	writeJSON(w, http.StatusOK, json.RawMessage(fetchValue))
 }
 
 // ---------- POST /api/products/:id ----------
 
-// UpdateProduct writes a new value to the DB and optionally invalidates the cache.
+// UpdateProduct writes a new value to the DB and optionally invalidates or write-through caches.
 func (h *Handler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	key := "product:" + id
@@ -211,7 +240,21 @@ func (h *Handler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if body.Invalidate {
+	h.mu.Lock()
+	strategy := h.cfg.Strategy
+	h.mu.Unlock()
+
+	if strategy == "write-through" {
+		ttl := h.actualTTL()
+		ttlMs := h.actualTTLMs()
+		if err := h.cache.Set(ctx, key, body.Value, ttl); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		h.broker.Publish(map[string]any{"type": "cache_set", "key": key, "value": body.Value, "ttlMs": ttlMs})
+		h.broker.Publish(h.cacheStateEvent(ctx))
+		h.watchExpiry(context.Background(), key, ttl)
+	} else if body.Invalidate {
 		if err := h.cache.Delete(ctx, key); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -221,6 +264,19 @@ func (h *Handler) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, json.RawMessage(body.Value))
+}
+
+// ---------- POST /api/cache/reset ----------
+
+// ResetCache flushes all cache entries and emits a cache_state event.
+func (h *Handler) ResetCache(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if err := h.cache.Flush(ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h.broker.Publish(h.cacheStateEvent(ctx))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ---------- GET /api/config ----------
@@ -238,9 +294,11 @@ func (h *Handler) GetConfig(w http.ResponseWriter, r *http.Request) {
 // UpdateConfig updates one or more config fields.
 func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		LatencyMs       *int `json:"latencyMs"`
-		TtlMs           *int `json:"ttlMs"`
-		SpeedMultiplier *int `json:"speedMultiplier"`
+		LatencyMs           *int    `json:"latencyMs"`
+		TtlMs               *int    `json:"ttlMs"`
+		SpeedMultiplier     *int    `json:"speedMultiplier"`
+		SingleflightEnabled *bool   `json:"singleflightEnabled"`
+		Strategy            *string `json:"strategy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -257,6 +315,15 @@ func (h *Handler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if body.SpeedMultiplier != nil {
 		if *body.SpeedMultiplier == 1 || *body.SpeedMultiplier == 5 || *body.SpeedMultiplier == 10 {
 			h.cfg.SpeedMultiplier = *body.SpeedMultiplier
+		}
+	}
+	if body.SingleflightEnabled != nil {
+		h.cfg.SingleflightEnabled = *body.SingleflightEnabled
+	}
+	if body.Strategy != nil {
+		s := *body.Strategy
+		if s == "cache-aside" || s == "read-through" || s == "write-through" {
+			h.cfg.Strategy = s
 		}
 	}
 	latencyMs := h.cfg.LatencyMs
