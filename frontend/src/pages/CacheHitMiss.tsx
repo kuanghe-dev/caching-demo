@@ -24,19 +24,23 @@ export function CacheHitMiss() {
   }, [location.pathname, clearEvents])
 
   // React to incoming events for animations.
-  // Process all new events as a sequential queue so that db_fetch and cache_set
-  // arriving in the same React batch don't cause db_fetch to be silently skipped.
+  // Each animatable event is placed on a flat timeline with a single cleanup at the end.
+  // Per-animation inner cleanup timers caused a race: when two events had the same cumulative
+  // delay (e.g. animation N's cleanup at d+dur and animation N+1's start at d+dur), the JS
+  // timer queue fired them in registration order — cleanup last — wiping the new animation.
   const processedCount = useRef(0)
-  // Tracks ALL timers (outer scheduling + inner cleanup) so a new batch can cancel everything.
   const timersRef = useRef<ReturnType<typeof setTimeout>[]>([])
 
   useEffect(() => {
     const newEvents = events.slice(processedCount.current)
     processedCount.current = events.length
-    if (newEvents.length === 0) return
 
-    // Cancel any in-flight timers from a previous batch, including orphaned cleanup timers
-    // that would otherwise fire and wipe out the new animation's state.
+    const animatable = newEvents.filter(
+      e => e.type === 'cache_hit' || e.type === 'cache_miss' || e.type === 'db_fetch' || e.type === 'cache_set'
+    )
+    if (animatable.length === 0) return
+
+    // Cancel all pending timers from a previous batch before scheduling new ones.
     timersRef.current.forEach(clearTimeout)
     timersRef.current = []
 
@@ -44,20 +48,19 @@ export function CacheHitMiss() {
 
     let delay = 0
 
-    for (const event of newEvents) {
+    for (const event of animatable) {
       if (event.type === 'cache_hit') {
         const d = delay
         push(setTimeout(() => {
           setActiveEdges(['client-cache', 'cache-client'])
           setFlash({ nodeId: 'cache', color: 'green' })
-          push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200))
         }, d))
         delay += 1200
       } else if (event.type === 'cache_miss') {
         const d = delay
         push(setTimeout(() => {
+          setActiveEdges([])
           setFlash({ nodeId: 'cache', color: 'red' })
-          push(setTimeout(() => setFlash(null), 600))
         }, d))
         delay += 600
       } else if (event.type === 'db_fetch') {
@@ -65,7 +68,6 @@ export function CacheHitMiss() {
         push(setTimeout(() => {
           setActiveEdges(['cache-db', 'db-cache'])
           setFlash({ nodeId: 'db', color: 'yellow' })
-          push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1200))
         }, d))
         delay += 1200
       } else if (event.type === 'cache_set') {
@@ -73,11 +75,13 @@ export function CacheHitMiss() {
         push(setTimeout(() => {
           setActiveEdges(['cache-client'])
           setFlash({ nodeId: 'cache', color: 'blue' })
-          push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, 1000))
         }, d))
         delay += 1000
       }
     }
+
+    // Single cleanup after the full sequence — no race possible with any animation start.
+    push(setTimeout(() => { setActiveEdges([]); setFlash(null) }, delay))
 
     return () => { timersRef.current.forEach(clearTimeout); timersRef.current = [] }
   }, [events])
